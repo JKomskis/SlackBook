@@ -116,7 +116,7 @@ function receivedMessage(event) {
 				}
 				//otherwise, try to subscribe the user to the channel events
 				Subscribe(messageData[1], messageData[2], senderID);
-				//if the message isn't one of the above formats, assume the user wants to send a message
+			//if the message isn't one of the above formats, assume the user wants to send a message
 			} else{
 				//get the team name, channel name, and message from the facebook message
 				let colon = messageText.indexOf(":");
