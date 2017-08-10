@@ -223,7 +223,7 @@ function SignIn(recipientId){
 					[
 						{
 							type:"web_url",
-							url:"https://slack.com/oauth/authorize?scope=identity.basic&client_id=" + process.env.SLACK_CLIENT_ID + "&state=" + recipientId,
+							url:"https://slack.com/oauth/authorize?scope=channels:history,channels:read,chat:write:user,groups:history,groups:read,team:read,users:read&client_id=" + process.env.SLACK_CLIENT_ID + "&state=" + recipientId,
 							title:"Sign In"
 						}
 					]
@@ -301,11 +301,11 @@ function Subscribe(teamName, channelName, fbID){
 						++j;
 					}
 					//stop if there are no matching groups
-					if(slackGroups[j].name != channelName && channels[i].name != channelName){
+					if(slackGroups.length > 0 && slackGroups[j].name != channelName && channels[i].name != channelName){
 						console.error("Channel " + channelName + " in team " + teamName + " does not exist.");
 						sendTextMessage(fbID, "Channel does not exist.");
 						return;
-					} else if(slackGroups[j].name === channelName){
+					} else if(slackGroups.length > 0 && slackGroups[j].name === channelName){
 						channelID = slackGroups[j].id;
 					}
 					SubscribeUpdateDatabase(fbID, teamID, teamName, channelID, channelName);
@@ -423,7 +423,6 @@ app.post('/slack', function(req, res) {
 						return;
 					}
 					let token = doc2.SLACK_TOKEN;
-					let fbID = doc2.FB_ID;
 					//use the access token to get the name of the Slack user who posted the message
 					request({
 						uri: "https://slack.com/api/users.info",
@@ -443,12 +442,18 @@ app.post('/slack', function(req, res) {
 							return;
 						}
 						let userName = JSONresponse.user.name;
-						//Send a message to each of the channel subscribers, except the user who posted the message
-						console.log("Sending message to channel subscribers.");
-						doc.USERS.forEach(function(user){
-							if(user != fbID){
-								sendTextMessage(user, teamName + "|" + channelName + "\n" + userName + ": " + message);
+						let fbID =0;
+						users.findOne( { $and: [ {SLACK_ID: slackID}, {SLACK_TEAM_ID: teamID} ] }, function(err, doc3){
+							if(doc3 != null){
+								fbID = doc3.FB_ID;
 							}
+							//Send a message to each of the channel subscribers, except the user who posted the message
+							console.log("Sending message to channel subscribers.");
+							doc.USERS.forEach(function(user){
+								if(user != fbID){
+									sendTextMessage(user, teamName + "|" + channelName + "\n" + userName + ": " + message);
+								}
+							});
 						});
 					});
 				} );
@@ -485,6 +490,7 @@ app.get('/auth/redirect', function(req, res) {
 		method: 'GET'
 	}, (error, response, body) => {
 		let JSONresponse = JSON.parse(body);
+		console.log(JSONresponse);
 		let fbID = req.query.state;
 		//stop if something wen't wrong
 		if (!JSONresponse.ok){
@@ -498,9 +504,10 @@ app.get('/auth/redirect', function(req, res) {
 			return;
 		}
 		//otherwise, process the response, get the user's name and the team's name, and update the database
-		let slackID = JSONresponse.user.id;
+		let slackID = JSONresponse.user_id;
 		let token = JSONresponse.access_token;
-		let teamID = JSONresponse.team.id;
+		let teamID = JSONresponse.team_id;
+		let teamName = JSONresponse.team_name;
 		console.log("Signing " + fbID + " into team " + teamID + ".");
 		//get the user's name
 		request({
@@ -523,7 +530,7 @@ app.get('/auth/redirect', function(req, res) {
 			}
 			let name = JSONresponse2.user.name;
 			//get the team name
-			request({
+			/*request({
 				uri: "https://slack.com/api/team.info",
 				qs: {
 					token: token,
@@ -541,7 +548,7 @@ app.get('/auth/redirect', function(req, res) {
 					sendTextMessage(fbID, "Sorry, we encountered an error while processing this request.");
 					return;
 				}
-				let teamName = JSONresponse3.team.name;
+				let teamName = JSONresponse3.team.name;*/
 				users.findOne( { $and: [ {FB_ID: fbID}, {SLACK_TEAM_ID: teamID} ] }, function(err, doc){
 					//if the user is not signed into the team, update the database
 					if(doc === null){
@@ -565,7 +572,7 @@ app.get('/auth/redirect', function(req, res) {
 			});
 		});
 		res.send("Success!");
-	})
+	//})
 });
 
 
