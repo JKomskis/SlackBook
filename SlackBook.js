@@ -1,6 +1,10 @@
 //
 // This is main file containing code implementing the Express server and functionality for the Express echo bot.
 //
+//TODO
+//make messages sent on slack show up in user's messenger conversation
+//store last team and channel posted to so user doesn't have to type it every time
+//look into adding buttons and quick replies to improve UX
 'use strict';
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -94,28 +98,32 @@ function receivedMessage(event) {
 				console.error(senderID + " is not signed into any Slack accounts.")
 				sendTextMessage(senderID, "You must sign in with at least one Slack account");
 				SignIn(senderID);
-				//if the message starts with "/signin," send them a sign in link
+			//if the message starts with "/signin," send them a sign in link
 			} else if( messageText.substring(0,7) === "/signin" ){
 				console.log(senderID + " requested a sign in link.")
 				SignIn(senderID);
-				//if the message starts with "/subscribe", process the message and update the database
+			} else if( messageText.substring(0,8) === "/signout" ){
+				let space = messageText.indexOf(" ");
+				let teamName = messageText.substring(space+1);
+				console.log(senderID + " requested to sign out of team " + teamName + ".");
+				SignOut(senderID, teamName);
+			//if the message starts with "/subscribe", process the message and update the database
 			} else if( messageText.substring(0,10) === "/subscribe"){
-				//split the message into team name and channel name
-				let messageData = messageText.match(/("[^"]+")|\S+/g);
-				//remove any extra quotation marks
-				for(let i = 0; i<messageData.length; ++i){
-					messageData[i] = messageData[i].replace(/"/g, "");
-				}
-				//if "/subscribe", a team name, and a channel name aren't present, warn the user and stop
-				if(messageData.length != 3){
-					console.error(senderID + " entered invalid subscribing syntax.");
-					console.error("Original Message: " + messageText);
-					console.error("Interpreted Message: " + messageData);
-					sendTextMessage(senderID, "Invalid syntax. Usage: /subscribe <team name> <channel name>");
+				//parse the message
+				let messageData = ParseSubscribeUnsubscribe(messageText, senderID);
+				if(messageData === null){
 					return;
 				}
 				//otherwise, try to subscribe the user to the channel events
 				Subscribe(messageData[1], messageData[2], senderID);
+			} else if( messageText.substring(0,12) === "/unsubscribe"){
+				//parse the message
+				let messageData = ParseSubscribeUnsubscribe(messageText, senderID);
+				if(messageData === null){
+					return;
+				}
+				//otherwise, try to unsubscribe the user to the channel events
+				Unsubscribe(messageData[1], messageData[2], senderID);
 			//if the message isn't one of the above formats, assume the user wants to send a message
 			} else{
 				//get the team name, channel name, and message from the facebook message
@@ -234,10 +242,65 @@ function SignIn(recipientId){
 	callSendAPI(messageData);
 }
 
+function SignOut(fbID, teamName){
+	users.findOne( { $and: [ {FB_ID: fbID}, {SLACK_TEAM_NAME: teamName} ] }, function(err, doc){
+		//stop if the user is not signed into the team
+		if(doc === null){
+			console.error(fbID + " is not signed into team " + teamName);
+			sendTextMessage(fbID, "You are not signed into this team.");
+			return;
+		}
+		request({
+			uri: "https://slack.com/api/auth.revoke",
+			qs: {
+				token: doc.SLACK_TOKEN,
+				exclude_members: "true"
+			},
+			method: "POST"
+		}, (error, response, body) => {
+			let JSONresponse = JSON.parse(body);
+			if(!JSONresponse.ok){
+				console.error("Error when logging user " + fbID + " out of team " + teamName + ".");
+				console.error("Error: " + error);
+				console.error("Response: " + response);
+				console.error("Body: " + body);
+				sendTextMessage(fbID, "Sorry, we encountered an error while processing this request.");
+				return;
+			}
+			users.remove( { $and: [ {FB_ID: fbID}, {SLACK_TEAM_NAME: teamName} ] }, {}, function (){} );
+			groups.update( {TEAM_NAME: teamName}, { $pull: {USERS: fbID} }, {}, function (){} );
+			console.log("Successfully logged user " + fbID + " out of team " + teamName + ".");
+			sendTextMessage(fbID, "You are now logged out of team " + teamName + ".");
+		});
+	});
+}
+
+//Preconditions: messageText is text from a Facebook message event
+//				senderID is the Facebook ID of the sender of the message
+//Postconditions: Parses the message and returns ["/subscribe", <Team Name>, <Channel Name>]
+//					or null if the message syntax was invalid
+function ParseSubscribeUnsubscribe(messageText, senderID){
+	let messageData = messageText.match(/("[^"]+")|\S+/g);
+	//remove any extra quotation marks
+	for(let i = 0; i<messageData.length; ++i){
+		messageData[i] = messageData[i].replace(/"/g, "");
+	}
+	//if "/subscribe", a team name, and a channel name aren't present, warn the user and stop
+	if(messageData.length != 3){
+		console.error(senderID + " entered invalid (un)subscribing syntax.");
+		console.error("Original Message: " + messageText);
+		console.error("Interpreted Message: " + messageData);
+		sendTextMessage(senderID, "Invalid syntax. Usage: /(un)subscribe <Team Name> <Channel Name>");
+		return null;
+	}
+	//otherwise, try to subscribe the user to the channel events
+	return messageData;
+}
+
 //Preconditions: channelName is a channel of team teamName
 //              teamName is a team the user is signed into
 //              fbID is the Facebook ID of the user who wants to subscibe to channelName
-//Postconditions: the user is subscribed to channelName by adding their fbID to the appropriate database entry
+//Postconditions: the user is unsubscribed from channelName by removing their fbID from the appropriate database entry
 function Subscribe(teamName, channelName, fbID){
 	console.log("Attempting to subscribe " + fbID + " to channel " + channelName + " of team " + teamName + ".");
 	//Get team ID
@@ -318,6 +381,31 @@ function Subscribe(teamName, channelName, fbID){
 	} );
 }
 
+//Preconditions: channelName is a channel of team teamName
+//              teamName is a team the user is signed into
+//              fbID is the Facebook ID of the user who wants to subscibe to channelName
+//Postconditions: the user is subscribed to channelName by adding their fbID to the appropriate database entry
+function Unsubscribe(teamName, channelName, fbID){
+	console.log("Attempting to unsubscribe " + fbID + " to channel " + channelName + " of team " + teamName + ".");
+	//Get team ID
+	groups.findOne( { $and: [ {TEAM_NAME: teamName}, {CHANNEL_NAME: channelName} ] }, function(err, doc){
+		//stop if the user is not signed into the team
+		if(doc === null){
+			console.error(fbID + " is not subscribed to channel " + channelName + " of team " + teamName);
+			sendTextMessage(fbID, "You are not subscribed to channel " + channelName + " of team " + teamName);
+			return;
+		}
+		console.log("Removing " + fbID + " from exisitng database entry.");
+		groups.update( { $and: [ {TEAM_NAME: teamName}, {CHANNEL_NAME: channelName} ] },
+			{ $pull: {USERS: fbID} }, {returnUpdatedDocs: true}, function (err, numAffected, updatedDoc){
+				if(updatedDoc.USERS.length === 0){
+				groups.remove( { $and: [ {TEAM_NAME: teamName}, {CHANNEL_NAME: channelName} ] }, {}, function (){} );
+				}
+		} );
+			sendTextMessage(fbID, "You are now unsubscribed from channel " + channelName + " in team " + teamName);
+	} );
+}
+
 function SubscribeUpdateDatabase(fbID, teamID, teamName, channelID, channelName){
 	groups.findOne( { $and: [ {TEAM_ID: teamID}, {CHANNEL_ID: channelID} ] }, function(err, doc){
 		//if there no users yet subscribed to the channel, create a new database entry
@@ -332,7 +420,7 @@ function SubscribeUpdateDatabase(fbID, teamID, teamName, channelID, channelName)
 			}, function(){} );
 		} else{
 			//otherwise, add the user to the existing entry
-			console.log("Adding " + fbID + " to exisitng database entry.")
+			console.log("Adding " + fbID + " to exisitng database entry.");
 			groups.update( { $and: [ {TEAM_ID: teamID}, {CHANNEL_ID: channelID} ] },
 				{ $addToSet: { USERS: fbID } }, {}, function (){} );
 		}
@@ -442,7 +530,7 @@ app.post('/slack', function(req, res) {
 							return;
 						}
 						let userName = JSONresponse.user.name;
-						let fbID =0;
+						let fbID = 0;
 						users.findOne( { $and: [ {SLACK_ID: slackID}, {SLACK_TEAM_ID: teamID} ] }, function(err, doc3){
 							if(doc3 != null){
 								fbID = doc3.FB_ID;
@@ -490,7 +578,6 @@ app.get('/auth/redirect', function(req, res) {
 		method: 'GET'
 	}, (error, response, body) => {
 		let JSONresponse = JSON.parse(body);
-		console.log(JSONresponse);
 		let fbID = req.query.state;
 		//stop if something wen't wrong
 		if (!JSONresponse.ok){
