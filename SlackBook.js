@@ -2,9 +2,9 @@
 // This is main file containing code implementing the Express server and functionality for the Express echo bot.
 //
 //TODO
-//make messages sent on slack show up in user's messenger conversation
-//store last team and channel posted to so user doesn't have to type it every time
-//look into adding buttons and quick replies to improve UX
+//Add support for images
+//Add support for emojis
+//Fixed messages with special characters (<, &, etc.)
 'use strict';
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -16,8 +16,9 @@ var messengerButton = "<html><head><title>Facebook Messenger Bot</title></head><
 
 // The rest of the code implements the routes for our Express server.
 var app = express();
-var groups = new Datastore({ filename: 'groups.db', autoload: true });
-var users = new Datastore({ filename: 'users.db', autoload: true });
+var groups = new Datastore({ filename: 'groups.json', autoload: true });
+var userLogins = new Datastore({ filename: 'userLogins.json', autoload: true });
+var userSettings = new Datastore({ filename: 'userSettings.json', autoload: true });
 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({
@@ -91,112 +92,97 @@ function receivedMessage(event) {
 	//var messageAttachments = message.attachments;
 	console.log("Received Facebook message from " + senderID + ": " + messageText);
 	if (messageText) {
-		users.findOne( { FB_ID: senderID }, function(err, doc){
+		userLogins.findOne( { FB_ID: senderID }, function(err, doc){
 			//make sure the user has at least one slack account linked to their facebook account
 			//if they don't, send them a sign in link
 			if( doc === null ){
 				console.error(senderID + " is not signed into any Slack accounts.")
 				sendTextMessage(senderID, "You must sign in with at least one Slack account");
 				SignIn(senderID);
-			//if the message starts with "/signin," send them a sign in link
+			//if the message starts with "/signin", send them a sign in link
 			} else if( messageText.substring(0,7) === "/signin" ){
 				console.log(senderID + " requested a sign in link.")
 				SignIn(senderID);
+			//if the message starts with "/signout", prompt to find which team the user wants to sign out of
 			} else if( messageText.substring(0,8) === "/signout" ){
-				let space = messageText.indexOf(" ");
-				let teamName = messageText.substring(space+1);
-				console.log(senderID + " requested to sign out of team " + teamName + ".");
-				SignOut(senderID, teamName);
-			//if the message starts with "/subscribe", process the message and update the database
+				//go to the signout part of the condition below
+				PromptTeams(senderID, "signout");
+			//if the message starts with "/subscribe", prompt to get the team of the channel to which the user wants to subscribe
 			} else if( messageText.substring(0,10) === "/subscribe"){
-				//parse the message
-				let messageData = ParseSubscribeUnsubscribe(messageText, senderID);
-				if(messageData === null){
-					return;
-				}
-				//otherwise, try to subscribe the user to the channel events
-				Subscribe(messageData[1], messageData[2], senderID);
+				//go to the subscribe part of the condition below
+				PromptTeams(senderID, "subscribe");
+			//if the message starts with "/unsubscribe", prompt to get the team of hte channel to which the users wants to unsubscribe
 			} else if( messageText.substring(0,12) === "/unsubscribe"){
-				//parse the message
-				let messageData = ParseSubscribeUnsubscribe(messageText, senderID);
-				if(messageData === null){
-					return;
+				//go to the unsubscribe part of the condition below
+				PromptTeams(senderID, "unsubscribe");
+			//if the message starts with "/select", prompt to find the team the user wants to select
+			} else if(messageText.substring(0,7) === "/select"){
+				//go to the select part of the condition below
+				PromptTeams(senderID, "select");
+			//if the message is a quick reply, process the payload
+			} else if(message.quick_reply != undefined){
+				//the payload is a string with pieces of information separated by "~_!", so split the payload by that string to get an array of information
+				let payload = message.quick_reply.payload.split("~_!");
+				//if the user was previously entered "/subscribe", prompt to get the channel to which the user wants to subscribe
+				if(payload[0] === "subscribe"){
+					let teamName = payload[1];
+					PromptAllChannels(senderID, teamName);
+				//if the user previously chose a channel to which to subscribe, update the database with the new subscription
+				} else if(payload[0] === "subscribe2"){
+					let teamID = payload[1];
+					let teamName = payload[2];
+					let channelID = payload[3];
+					let channelName = payload[4];
+					SubscribeUpdateDatabase(senderID, teamID, teamName, channelID, channelName);
+				//if the user previously entered "/unsubscribe", prompt to get the channel to which the user wants to unsubscribe
+				} else if(payload[0] === "unsubscribe"){
+					let teamName = payload[1]
+					PromptSubscribedChannels(senderID, teamName, "unsubscribe2");
+				//if the user previously chose a channel to which to unsubscribe, update the database with the new changes
+				} else if(payload[0] === "unsubscribe2"){
+					let teamName = payload[1];
+					let channelName = payload[2];
+					Unsubscribe(teamName, channelName, senderID);
+				//if the user previously entered "/signout", update the database with the new changes
+				} else if(payload[0] === "signout"){
+					let teamName = payload[1]
+					SignOut(senderID, teamName);
+				//if the user previously entered "/select", prompt to find the channel the user wants to select
+				} else if(payload[0] === "select"){
+					let teamName = payload[1];
+					PromptSubscribedChannels(senderID, teamName, "select2");
+				//if the user previously entered a channel to select, update the database with user's selected team and channel
+				} else if(payload[0] === "select2"){
+					let teamName = payload[1];
+					let channelName = payload[2];
+					SelectTeamChannel(senderID, teamName, channelName);
 				}
-				//otherwise, try to unsubscribe the user to the channel events
-				Unsubscribe(messageData[1], messageData[2], senderID);
 			//if the message isn't one of the above formats, assume the user wants to send a message
 			} else{
 				//get the team name, channel name, and message from the facebook message
 				let colon = messageText.indexOf(":");
 				let space = messageText.indexOf(" ", colon);
-				//make sure the message is properly formatted
+				let teamName = null;
+				let channelName = null;
+				let message = null;
+				//if the user doesn't specify the channel and team, get his/her selected team and channel
 				if(colon === -1 || space === -1){
-					console.error(senderID + " entered invalid posting syntax.");
-					console.error("Original Message: " + messageText);
-					sendTextMessage(senderID, "Invalid syntax. Usage: <team name>:<channel name> <message>");
-					return;
+					userSettings.findOne( {FB_ID: senderID}, function(err, doc){
+						teamName = doc.SELECTED_TEAM;
+						channelName = doc.SELECTED_CHANNEL;
+						message = messageText;
+						sendSlackMessage(senderID, teamName, channelName, message);
+					});
+				//otherwise, parse the message for them and send the message based on them
+				} else {
+					teamName = messageText.substring(0, colon);
+					channelName = messageText.substring(colon+1, space);
+					message = messageText.substring(space+1);
+					sendSlackMessage(senderID, teamName, channelName, message);
 				}
-				let teamName = messageText.substring(0, colon);
-				let channelName = messageText.substring(colon+1, space);
-				let message = messageText.substring(space+1);
-				//get the user's access token
-				console.log(senderID + " is trying to send message to channel " + channelName + " of team " + teamName + ".");
-				console.log("Message: " + message);
-				users.findOne( { $and: [ {FB_ID: senderID}, {SLACK_TEAM_NAME: teamName} ] }, function(err, doc){
-					let token = 0;
-					//stop if the user is not signed into the team
-					if(doc === null){
-						console.error(senderID + " is not signed into team " + teamName);
-						sendTextMessage(senderID, "You are not signed into " + teamName + ".");
-						return;
-					}
-					token = doc.SLACK_TOKEN;
-					//get the channel id
-					groups.findOne( { $and: [ {TEAM_NAME: teamName}, {CHANNEL_NAME: channelName} ] }, function(err, doc2){
-						//stop if the channel does not exist
-						if(doc2 === null){
-							console.error("Channel " + channelName + " in team " + teamName + " does not exist.");
-							sendTextMessage(senderID, "Channel " + channelName + " in team " + teamName + " does not exist.");
-							return;
-						}
-						let channelID = doc2.CHANNEL_ID;
-						//post the message to Slack
-						request({
-							uri: 'https://slack.com/api/chat.postMessage',
-							qs: {
-								token: token,
-								channel: channelID,
-								text: message,
-								as_user: true
-							},
-							method: 'POST'
-						}, function (error, response, body) {
-							let JSONresponse = JSON.parse(body);
-							/*if (!error && response.statusCode == 200) {
-								console.log(body);
-							} else {
-								console.error("Error");
-								console.error(response);
-								console.error(error);
-							}*/
-							if (!JSONresponse.ok){
-								console.error("Unable to send message from " + senderID + " to channel " + channelName + " of team " + teamName + ".");
-								console.error("Error while sending message from " + senderID + " to channel " + channelName + " of team " + teamName + ".");
-								console.error("Error: " + error);
-								console.error("Response: " + response);
-								console.error("Body: " + body);
-								sendTextMessage(senderID, "Sorry, we encountered an error while sending this message.");
-								return;
-							}
-							console.log("Successfully sent message.");
-						});
-					} );
-				} );
 			}
 		} );
-	} //else if (messageAttachments) {
-		//sendTextMessage(senderID, "Message with attachment received");
-		//}
+	}
 }
 
 //Postback event
@@ -242,14 +228,18 @@ function SignIn(recipientId){
 	callSendAPI(messageData);
 }
 
+//Preconditions: fbID is a valid Facebook ID
+//				teamName is a team the user is currently signed into
+//Postconditions: The user's auth token is revoked and the database document is removed
 function SignOut(fbID, teamName){
-	users.findOne( { $and: [ {FB_ID: fbID}, {SLACK_TEAM_NAME: teamName} ] }, function(err, doc){
+	userLogins.findOne( { $and: [ {FB_ID: fbID}, {SLACK_TEAM_NAME: teamName} ] }, function(err, doc){
 		//stop if the user is not signed into the team
 		if(doc === null){
 			console.error(fbID + " is not signed into team " + teamName);
 			sendTextMessage(fbID, "You are not signed into this team.");
 			return;
 		}
+		//revoke the user's auth token
 		request({
 			uri: "https://slack.com/api/auth.revoke",
 			qs: {
@@ -267,7 +257,15 @@ function SignOut(fbID, teamName){
 				sendTextMessage(fbID, "Sorry, we encountered an error while processing this request.");
 				return;
 			}
-			users.remove( { $and: [ {FB_ID: fbID}, {SLACK_TEAM_NAME: teamName} ] }, {}, function (){} );
+			//remove the user's login document
+			userLogins.remove( { $and: [ {FB_ID: fbID}, {SLACK_TEAM_NAME: teamName} ] }, {}, function (){} );
+			//if that was the only team the user was logged into, delete the user's settings document
+			userLogins.count({ FB_ID: fbID }, function (err, count) {
+				if(count === 0){
+					userSettings.remove( {FB_ID: fbID}, {}, function (){} );
+				}
+			});
+			//remove the user's subscription from all channels of the team
 			groups.update( {TEAM_NAME: teamName}, { $pull: {USERS: fbID} }, {}, function (){} );
 			console.log("Successfully logged user " + fbID + " out of team " + teamName + ".");
 			sendTextMessage(fbID, "You are now logged out of team " + teamName + ".");
@@ -275,36 +273,42 @@ function SignOut(fbID, teamName){
 	});
 }
 
-//Preconditions: messageText is text from a Facebook message event
-//				senderID is the Facebook ID of the sender of the message
-//Postconditions: Parses the message and returns ["/subscribe", <Team Name>, <Channel Name>]
-//					or null if the message syntax was invalid
-function ParseSubscribeUnsubscribe(messageText, senderID){
-	let messageData = messageText.match(/("[^"]+")|\S+/g);
-	//remove any extra quotation marks
-	for(let i = 0; i<messageData.length; ++i){
-		messageData[i] = messageData[i].replace(/"/g, "");
-	}
-	//if "/subscribe", a team name, and a channel name aren't present, warn the user and stop
-	if(messageData.length != 3){
-		console.error(senderID + " entered invalid (un)subscribing syntax.");
-		console.error("Original Message: " + messageText);
-		console.error("Interpreted Message: " + messageData);
-		sendTextMessage(senderID, "Invalid syntax. Usage: /(un)subscribe <Team Name> <Channel Name>");
-		return null;
-	}
-	//otherwise, try to subscribe the user to the channel events
-	return messageData;
+//Preconditions: fbID is a valid Facebook ID
+//				nextFunction is the next function that will be executed in the condition
+//Postconditions: sends fbID a message with each team they are signed into as a quick reply
+function PromptTeams(fbID, nextFunction){
+	userLogins.find( {FB_ID: fbID}, function(err, doc){
+		//make sure the user is logged into at least one team
+		if(doc === null){
+			console.error(fbID + " is not signed into any teams.");
+			sendTextMessage(fbID, "You are not signed into any teams.");
+			return;
+		}
+		//go through each of the user's logins, and add each team as a quick reply button
+		let quickReplyButtons = [];
+		doc.forEach(function(login){
+			quickReplyButtons.push({
+				"content_type" : "text",
+				"title" : login.SLACK_TEAM_NAME,
+				"payload" : nextFunction + "~_!" + login.SLACK_TEAM_NAME
+			});
+		});
+		//build the message and send it to the user
+		let messageData = {
+			"recipient":{
+				"id": fbID
+			},
+			"message":{
+				"text":"Pick a team:",
+				"quick_replies": quickReplyButtons
+			}
+		}
+		callSendAPI(messageData);
+	});
 }
 
-//Preconditions: channelName is a channel of team teamName
-//              teamName is a team the user is signed into
-//              fbID is the Facebook ID of the user who wants to subscibe to channelName
-//Postconditions: the user is unsubscribed from channelName by removing their fbID from the appropriate database entry
-function Subscribe(teamName, channelName, fbID){
-	console.log("Attempting to subscribe " + fbID + " to channel " + channelName + " of team " + teamName + ".");
-	//Get team ID
-	users.findOne( { $and: [ {FB_ID: fbID}, {SLACK_TEAM_NAME: teamName} ] }, function(err, doc){
+function PromptAllChannels(fbID, teamName){
+	userLogins.findOne( { $and: [ {FB_ID: fbID}, {SLACK_TEAM_NAME: teamName} ] }, function(err, doc){
 		//stop if the user is not signed into the team
 		if(doc === null){
 			console.error(fbID + " is not signed into team " + teamName);
@@ -312,7 +316,6 @@ function Subscribe(teamName, channelName, fbID){
 			return;
 		}
 		let teamID = doc.SLACK_TEAM_ID;
-		let channelID = 0;
 		//Get channel ID
 		request({
 			uri: "https://slack.com/api/channels.list",
@@ -324,7 +327,7 @@ function Subscribe(teamName, channelName, fbID){
 		}, (error, response, body) => {
 			let JSONresponse = JSON.parse(body);
 			if(!JSONresponse.ok){
-				console.error("Error when getting list of groups from " + teamName + ".");
+				console.error("Error when getting list of channels from " + teamName + ".");
 				console.error("Error: " + error);
 				console.error("Response: " + response);
 				console.error("Body: " + body);
@@ -332,53 +335,80 @@ function Subscribe(teamName, channelName, fbID){
 				return;
 			}
 			let channels = JSONresponse.channels;
-			//got through the channels and find the channel with the matching name
-			let i=0;
-			while(i<channels.length-1 && channels[i].name != channelName){
-				++i;
-			}
-			channelID = channels[i].id;
-			//if there are no matching channels, check if there is a matching group
-			//if(channels[i].name != channelName){
-				request({
-					uri: "https://slack.com/api/groups.list",
-					qs: {
-						token: doc.SLACK_TOKEN,
-						exclude_members: "true"
-					},
-					method: "POST"
-				}, (error, response, body) => {
-					let JSONresponse = JSON.parse(body);
-					if(!JSONresponse.ok){
-						console.error("Error when getting list of groups from " + teamName + ".");
-						console.error("Error: " + error);
-						console.error("Response: " + response);
-						console.error("Body: " + body);
-						sendTextMessage(fbID, "Sorry, we encountered an error while processing this request.");
-						return;
-					}
-					let slackGroups = JSONresponse.groups;
-					//go through the groups and find the group with the matching name
-					let j=0;
-					while(j<slackGroups.length-1 && slackGroups[j].name != channelName){
-						++j;
-					}
-					//stop if there are no matching groups
-					if(slackGroups.length > 0 && slackGroups[j].name != channelName && channels[i].name != channelName){
-						console.error("Channel " + channelName + " in team " + teamName + " does not exist.");
-						sendTextMessage(fbID, "Channel does not exist.");
-						return;
-					} else if(slackGroups.length > 0 && slackGroups[j].name === channelName){
-						channelID = slackGroups[j].id;
-					}
-					SubscribeUpdateDatabase(fbID, teamID, teamName, channelID, channelName);
-					return;
-					//find the corresponding database entry
+			let quickReplyButtons = [];
+			channels.forEach(function(channel){
+				quickReplyButtons.push({
+					"content_type" : "text",
+					"title" : channel.name,
+					"payload" : "subscribe2~_!" + teamID + "~_!" + teamName + "~_!" + channel.id + "~_!" + channel.name
 				});
-			//}
-			//SubscribeUpdateDatabase(fbID, teamID, teamName, channelID, channelName);
+			});
+			request({
+				uri: "https://slack.com/api/groups.list",
+				qs: {
+					token: doc.SLACK_TOKEN,
+					exclude_members: "true"
+				},
+				method: "POST"
+			}, (error, response, body) => {
+				let JSONresponse = JSON.parse(body);
+				if(!JSONresponse.ok){
+					console.error("Error when getting list of groups from " + teamName + ".");
+					console.error("Error: " + error);
+					console.error("Response: " + response);
+					console.error("Body: " + body);
+					sendTextMessage(fbID, "Sorry, we encountered an error while processing this request.");
+					return;
+				}
+				let slackGroups = JSONresponse.groups;
+				slackGroups.forEach(function(slackGroup){
+					quickReplyButtons.push({
+						"content_type" : "text",
+						"title" : slackGroup.name,
+						"payload" : "subscribe2~_!" + teamID + "~_!" + teamName + "~_!"  + slackGroup.id + "~_!" + slackGroup.name
+					});
+				});
+				let messageData = {
+					"recipient":{
+						"id": fbID
+					},
+					"message":{
+						"text":"Pick a channel:",
+						"quick_replies": quickReplyButtons
+					}
+				}
+				callSendAPI(messageData);
+			});
 		});
-	} );
+	});
+}
+
+function PromptSubscribedChannels(fbID, teamName, nextFunction){
+	groups.find( { $and: [ {TEAM_NAME: teamName}, {USERS: fbID} ] }, function(err, doc){
+		if(doc === null){
+			console.error(fbID + " is not subscribed to any teams from team " + teamName);
+			sendTextMessage(fbID, "You are not subscribed to any channels from this team.");
+			return;
+		}
+		let quickReplyButtons = [];
+		doc.forEach(function(group){
+			quickReplyButtons.push({
+				"content_type" : "text",
+				"title" : group.CHANNEL_NAME,
+				"payload" : nextFunction + "~_!" + group.TEAM_NAME + "~_!"  + group.CHANNEL_NAME
+			});
+		});
+		let messageData = {
+			"recipient":{
+				"id": fbID
+			},
+			"message":{
+				"text":"Pick a channel:",
+				"quick_replies": quickReplyButtons
+			}
+		}
+		callSendAPI(messageData);
+	});
 }
 
 //Preconditions: channelName is a channel of team teamName
@@ -424,7 +454,68 @@ function SubscribeUpdateDatabase(fbID, teamID, teamName, channelID, channelName)
 			groups.update( { $and: [ {TEAM_ID: teamID}, {CHANNEL_ID: channelID} ] },
 				{ $addToSet: { USERS: fbID } }, {}, function (){} );
 		}
+		SelectTeamChannel(fbID, teamName, channelName);
 		sendTextMessage(fbID, "You are now subscribed to channel " + channelName + " in team " + teamName);
+	} );
+}
+
+function SelectTeamChannel(senderID, teamName, channelName){
+	userSettings.update({FB_ID: senderID}, {$set: {SELECTED_TEAM: teamName, SELECTED_CHANNEL: channelName}});
+	console.log(senderID + " selected channel " + channelName + " in team " + teamName);
+	sendTextMessage(senderID, "You have selected channel " + channelName + " in team " + teamName);
+}
+
+function sendSlackMessage(senderID, teamName, channelName, message){
+	console.log(senderID + " is trying to send message to channel " + channelName + " of team " + teamName + ".");
+	console.log("Message: " + message);
+	if(teamName === "" || channelName === ""){
+		console.error(senderID + " has not selected a team or channel.");
+		sendTextMessage(senderID, "You have not selected a team or channel. Use \"/select\" to select a team and channel.");
+		return;
+	}
+	userLogins.findOne( { $and: [ {FB_ID: senderID}, {SLACK_TEAM_NAME: teamName} ] }, function(err, doc){
+		let token = 0;
+		//stop if the user is not signed into the team
+		if(doc === null){
+			console.error(senderID + " is not signed into team " + teamName);
+			sendTextMessage(senderID, "You are not signed into " + teamName + ".");
+			return;
+		}
+		token = doc.SLACK_TOKEN;
+		//get the channel id
+		groups.findOne( { $and: [ {TEAM_NAME: teamName}, {CHANNEL_NAME: channelName} ] }, function(err, doc2){
+			//stop if the channel does not exist
+			if(doc2 === null){
+				console.error("Channel " + channelName + " in team " + teamName + " does not exist.");
+				sendTextMessage(senderID, "Channel " + channelName + " in team " + teamName + " does not exist.");
+				return;
+			}
+			userSettings.update( {FB_ID: senderID}, {$set : {SELECTED_TEAM: teamName, SELECTED_CHANNEL: channelName, LAST_FB_MESSAGE: message}} );
+			let channelID = doc2.CHANNEL_ID;
+			//post the message to Slack
+			request({
+				uri: 'https://slack.com/api/chat.postMessage',
+				qs: {
+					token: token,
+					channel: channelID,
+					text: message,
+					as_user: true
+				},
+				method: 'POST'
+			}, function (error, response, body) {
+				let JSONresponse = JSON.parse(body);
+				if (!JSONresponse.ok){
+					console.error("Unable to send message from " + senderID + " to channel " + channelName + " of team " + teamName + ".");
+					console.error("Error while sending message from " + senderID + " to channel " + channelName + " of team " + teamName + ".");
+					console.error("Error: " + error);
+					console.error("Response: " + response);
+					console.error("Body: " + body);
+					sendTextMessage(senderID, "Sorry, we encountered an error while sending this message.");
+					return;
+				}
+				console.log("Successfully sent message.");
+			});
+		} );
 	} );
 }
 
@@ -505,7 +596,7 @@ app.post('/slack', function(req, res) {
 				//otherwise, get an access token from one of the subscribers
 				let teamName = doc.TEAM_NAME;
 				let channelName = doc.CHANNEL_NAME;
-				users.findOne( { $and: [ {FB_ID: doc.USERS[0]}, {SLACK_TEAM_ID: teamID} ] }, function(err, doc2){
+				userLogins.findOne( { $and: [ {FB_ID: doc.USERS[0]}, {SLACK_TEAM_ID: teamID} ] }, function(err, doc2){
 					if(doc2 === null){
 						console.error("The user and group databases must be out of sync.");
 						return;
@@ -530,18 +621,26 @@ app.post('/slack', function(req, res) {
 							return;
 						}
 						let userName = JSONresponse.user.name;
+						//get the FAcebook ID of the sender
 						let fbID = 0;
-						users.findOne( { $and: [ {SLACK_ID: slackID}, {SLACK_TEAM_ID: teamID} ] }, function(err, doc3){
+						userLogins.findOne( { $and: [ {SLACK_ID: slackID}, {SLACK_TEAM_ID: teamID} ] }, function(err, doc3){
 							if(doc3 != null){
 								fbID = doc3.FB_ID;
 							}
-							//Send a message to each of the channel subscribers, except the user who posted the message
-							console.log("Sending message to channel subscribers.");
-							doc.USERS.forEach(function(user){
-								if(user != fbID){
-									sendTextMessage(user, teamName + "|" + channelName + "\n" + userName + ": " + message);
+							let lastFBMessage = "";
+							userSettings.findOne( {FB_ID: fbID }, function(err, doc4){
+								if(doc4 != null){
+									lastFBMessage = doc4.LAST_FB_MESSAGE;
 								}
+								console.log("Sending message to channel subscribers.");
+								let fromSlack = lastFBMessage != message;
+								doc.USERS.forEach(function(user){
+									if(user != fbID || fromSlack){
+										sendTextMessage(user, teamName + "|" + channelName + "\n" + userName + ": " + message);
+									}
+								});
 							});
+							//Send a message to each of the channel subscribers, except the user who posted the message
 						});
 					});
 				} );
@@ -552,7 +651,7 @@ app.post('/slack', function(req, res) {
 			let teamID = req.body.team_id;
 			let newName = req.body.event.name;
 			console.log("Team " + teamID + " was renamed to " + newName);
-			users.update( {SLACK_TEAM_ID: teamID},
+			userLogins.update( {SLACK_TEAM_ID: teamID},
 				{ $set: { SLACK_TEAM_NAME: newName } }, {}, function (){} );
 			groups.update( {TEAM_ID: teamID},
 				{ $set: { TEAM_NAME: newName } }, {}, function (){} );
@@ -562,7 +661,7 @@ app.post('/slack', function(req, res) {
 					let slackID = req.body.event.user.id;
 					let newName = req.body.event.user.name;
 					console.log("User " + slackID + "'s name is now " + newName);
-					users.update( {SLACK_ID: slackID},
+					userLogins.update( {SLACK_ID: slackID},
 						{ $set: { SLACK_NAME: newName } }, {}, function (){} );
 		}
 });
@@ -616,30 +715,10 @@ app.get('/auth/redirect', function(req, res) {
 				return;
 			}
 			let name = JSONresponse2.user.name;
-			//get the team name
-			/*request({
-				uri: "https://slack.com/api/team.info",
-				qs: {
-					token: token,
-					user: slackID
-				},
-				method: "POST"
-			}, (error, response, body) => {
-				let JSONresponse3 = JSON.parse(body);
-				if (!JSONresponse3.ok){
-					console.log("Unable to sign user " + fbID + " into team " + teamID + ".")
-					console.log("Error while getting information about team " + teamID + ".");
-					console.log("Error: " + error);
-					console.log("Response: " + response);
-					console.log("Body: " + body);
-					sendTextMessage(fbID, "Sorry, we encountered an error while processing this request.");
-					return;
-				}
-				let teamName = JSONresponse3.team.name;*/
-				users.findOne( { $and: [ {FB_ID: fbID}, {SLACK_TEAM_ID: teamID} ] }, function(err, doc){
+				userLogins.findOne( { $and: [ {FB_ID: fbID}, {SLACK_TEAM_ID: teamID} ] }, function(err, doc){
 					//if the user is not signed into the team, update the database
 					if(doc === null){
-						users.insert( {
+						userLogins.insert( {
 							FB_ID: fbID,
 							SLACK_ID: slackID,
 							SLACK_NAME: name,
@@ -647,6 +726,12 @@ app.get('/auth/redirect', function(req, res) {
 							SLACK_TEAM_ID: teamID,
 							SLACK_TEAM_NAME: teamName
 						}, function(){} );
+						userSettings.insert( {
+							FB_ID: fbID,
+							SELECTED_TEAM: "",
+							SELECTED_CHANNEL: "",
+							LAST_FB_MESSAGE: ""
+						})
 						console.log(fbID + " is now signed into team " + teamName);
 						sendTextMessage(fbID, "You are now signed into " + teamName + ".")
 					//otherwise, do nothing
