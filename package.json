@@ -21,6 +21,7 @@
   "dependencies": {
     "body-parser": "*",
     "dotenv": "^4.0.0",
+    "emoji-js": "^3.2.2",
     "express": "*",
     "nedb": "^1.8.0",
     "request": "^2.72.0"

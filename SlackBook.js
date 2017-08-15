@@ -3,15 +3,17 @@
 //
 //TODO
 //Add support for images
-//Add support for emojis
-//Fixed messages with special characters (<, &, etc.)
 'use strict';
 const express = require('express');
 const bodyParser = require('body-parser');
 const request = require('request');
+const emoji_js = require('emoji-js');
 //const path = require('path');
 require('dotenv').config();
 var Datastore = require('nedb');
+var emoji = new emoji_js.EmojiConvertor();
+emoji.init_env();
+emoji.replace_mode = 'unified';
 var messengerButton = "<html><head><title>Facebook Messenger Bot</title></head><body><h1>Facebook Messenger Bot</h1>This is a bot based on Messenger Platform QuickStart. For more details, see their <a href=\"https://developers.facebook.com/docs/messenger-platform/guides/quick-start\">docs</a>.<script src=\"https://button.glitch.me/button.js\" data-style=\"glitch\"></script><div class=\"glitchButton\" style=\"position:fixed;top:20px;right:20px;\"></div></body></html>";
 
 // The rest of the code implements the routes for our Express server.
@@ -576,6 +578,12 @@ app.post('/slack', function(req, res) {
 		let channelID = req.body.event.channel;
 		let slackID = req.body.event.user;
 		let message = req.body.event.text;
+		message = message.replace(/:[A-Za-z0-9-_+]+:/g, function(match){
+			return emoji.replace_colons(match);
+		});
+		message = message.replace(/&amp;/g, "&");
+		message = message.replace(/&lt;/g, "<");
+		message = message.replace(/&gt;/g, ">");
 		console.log("Message posted to channel " + channelID + " of team " + teamID + ".");
 		console.log("Message: " + message);
 		//If the message is from a channel rename, update the database
